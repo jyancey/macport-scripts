@@ -1,0 +1,921 @@
+#!/usr/bin/env zsh
+#
+# MacPortsUpDate 3.0.0
+# Safely update, upgrade, diagnose, and maintain MacPorts.
+#
+
+emulate -R zsh
+setopt ERR_EXIT NO_UNSET PIPE_FAIL
+
+# Load Zsh date/time functionality.
+zmodload zsh/datetime || {
+    print -u2 "ERROR: Unable to load zsh/datetime module"
+    exit 1
+}
+
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
+readonly VERSION="3.0.0"
+readonly PROGNAME="${0:t}"
+
+typeset -g  MP_PREFIX=""
+typeset -g  PORT_BIN=""
+typeset -g  SUDO_BIN=""
+typeset -ga PORT_COMMAND=()
+typeset -g  LOGFILE=""
+typeset -g  LOCKDIR=""
+
+typeset -gi DRY_RUN=0
+typeset -gi CHECK_ONLY=0
+typeset -gi DO_SELFUPDATE=1
+typeset -gi DO_UPGRADE=1
+typeset -gi CLEANUP_INACTIVE=0
+typeset -gi CLEANUP_SAVED=0
+typeset -gi DO_RECLAIM=0
+typeset -gi VERBOSE=0
+typeset -gi QUIET=0
+typeset -gi NO_LOG=0
+typeset -gi ASSUME_YES=0
+
+typeset -gi LOG_MAX_BYTES=$((5 * 1024 * 1024))
+typeset -gi LOG_BACKUPS=5
+
+typeset -gi START_TIME=$EPOCHSECONDS
+typeset -gi FINAL_STATUS=0
+
+typeset -g  SELFUPDATE_STATUS="SKIPPED"
+typeset -g  UPGRADE_STATUS="SKIPPED"
+typeset -g  INACTIVE_STATUS="SKIPPED"
+typeset -g  SAVED_STATUS="SKIPPED"
+typeset -g  RECLAIM_STATUS="SKIPPED"
+
+typeset -gi OUTDATED_COUNT=0
+typeset -g  OUTDATED_BEFORE="Unknown"
+typeset -g  OUTDATED_AFTER="Unknown"
+
+typeset -gi LOCK_ACQUIRED=0
+
+# ------------------------------------------------------------
+# Usage
+# ------------------------------------------------------------
+usage() {
+    cat <<EOF
+MacPortsUpDate ${VERSION}
+
+Usage:
+  ${PROGNAME} [OPTIONS]
+
+General:
+  --prefix PATH         MacPorts installation prefix
+  --dry-run             Preview mutating commands
+  --check               Read-only diagnostic mode
+  --verbose             Enable detailed output
+  --quiet               Suppress informational console output
+  --yes                 Allow noninteractive MacPorts operations
+  --version             Display version
+  -h, --help            Display this help
+
+Mutating operations request sudo when run by a regular user. Read-only
+checks and dry-runs do not require elevated privileges.
+
+Updates:
+  --no-selfupdate       Skip port selfupdate
+  --no-upgrade          Skip upgrading outdated ports
+
+Maintenance:
+  --cleanup-inactive    Uninstall inactive ports
+  --cleanup-saved       Review and remove saved MacPorts files
+  --reclaim             Run port reclaim
+
+Logging:
+  --log-file PATH       Specify log file
+  --no-log              Disable file logging
+
+Examples:
+  ${PROGNAME}
+  ${PROGNAME} --dry-run
+  ${PROGNAME} --check
+  ${PROGNAME} --cleanup-inactive
+  ${PROGNAME} --reclaim
+  ${PROGNAME} --cleanup-inactive --reclaim
+  ${PROGNAME} --prefix /opt/local
+
+Default behavior:
+  1. Validate MacPorts
+  2. Run selfupdate
+  3. List outdated ports
+  4. Upgrade outdated ports
+  5. Display final summary
+
+Cleanup is disabled by default.
+EOF
+}
+
+# ------------------------------------------------------------
+# Argument Parsing
+# ------------------------------------------------------------
+parse_arguments() {
+    while (( $# )); do
+        case "$1" in
+            --prefix|--log-file)
+                if (( $# < 2 )) || [[ -z "$2" || "$2" == --* ]]; then
+                    print -u2 "ERROR: $1 requires a value"
+                    return 2
+                fi
+
+                if [[ "$1" == "--prefix" ]]; then
+                    MP_PREFIX="$2"
+                else
+                    LOGFILE="$2"
+                fi
+
+                shift 2
+                ;;
+
+            --prefix=*)
+                MP_PREFIX="${1#*=}"
+                shift
+                ;;
+
+            --log-file=*)
+                LOGFILE="${1#*=}"
+                shift
+                ;;
+
+            --dry-run)
+                DRY_RUN=1
+                shift
+                ;;
+
+            --check)
+                CHECK_ONLY=1
+                shift
+                ;;
+
+            --no-selfupdate)
+                DO_SELFUPDATE=0
+                shift
+                ;;
+
+            --no-upgrade)
+                DO_UPGRADE=0
+                shift
+                ;;
+
+            --cleanup-inactive)
+                CLEANUP_INACTIVE=1
+                shift
+                ;;
+
+            --cleanup-saved)
+                CLEANUP_SAVED=1
+                shift
+                ;;
+
+            --reclaim)
+                DO_RECLAIM=1
+                shift
+                ;;
+
+            --verbose)
+                VERBOSE=1
+                shift
+                ;;
+
+            --quiet)
+                QUIET=1
+                shift
+                ;;
+
+            --no-log)
+                NO_LOG=1
+                shift
+                ;;
+
+            --yes)
+                ASSUME_YES=1
+                shift
+                ;;
+
+            --version)
+                print "MacPortsUpDate ${VERSION}"
+                exit 0
+                ;;
+
+            -h|--help)
+                usage
+                exit 0
+                ;;
+
+            *)
+                print -u2 "ERROR: Unknown argument: $1"
+                return 2
+                ;;
+        esac
+    done
+
+    if [[ -z "$MP_PREFIX" && -n "$PORT_BIN" ]]; then
+        MP_PREFIX="${PORT_BIN:h:h}"
+    fi
+
+    if [[ -z "$MP_PREFIX" || "$MP_PREFIX" != /* ]]; then
+        if [[ -n "$MP_PREFIX" ]]; then
+            print -u2 "ERROR: --prefix must be an absolute path"
+            return 2
+        fi
+    fi
+
+    if [[ -z "$LOGFILE" && $NO_LOG -eq 0 ]]; then
+        LOGFILE="${HOME}/.local/state/macportsupdate/update.log"
+    fi
+
+    if [[ -n "$LOGFILE" && "$LOGFILE" != /* ]]; then
+        print -u2 "ERROR: --log-file must be an absolute path"
+        return 2
+    fi
+}
+
+# ------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------
+timestamp() {
+    strftime "%Y-%m-%dT%H:%M:%SZ" "$EPOCHSECONDS"
+}
+
+rotate_logs() {
+    (( NO_LOG )) && return 0
+    [[ -f "$LOGFILE" ]] || return 0
+
+    local size
+    size=$(wc -c < "$LOGFILE")
+    size=${size//[[:space:]]/}
+
+    (( size < LOG_MAX_BYTES )) && return 0
+
+    local i
+
+    for (( i = LOG_BACKUPS; i >= 1; i-- )); do
+        if [[ -f "${LOGFILE}.${i}" ]]; then
+            if (( i == LOG_BACKUPS )); then
+                rm -f -- "${LOGFILE}.${i}"
+            else
+                mv -f -- \
+                    "${LOGFILE}.${i}" \
+                    "${LOGFILE}.$((i + 1))"
+            fi
+        fi
+    done
+
+    mv -f -- "$LOGFILE" "${LOGFILE}.1"
+    : > "$LOGFILE"
+}
+
+initialize_logging() {
+    (( NO_LOG )) && return 0
+
+    local logdir="${LOGFILE:h}"
+
+    if ! mkdir -p -- "$logdir" 2>/dev/null; then
+        print -u2 "WARNING: Cannot create log directory: $logdir"
+        NO_LOG=1
+        return 0
+    fi
+
+    if ! touch -- "$LOGFILE" 2>/dev/null; then
+        print -u2 "WARNING: Cannot write log file: $LOGFILE"
+        NO_LOG=1
+        return 0
+    fi
+
+    rotate_logs
+}
+
+log_message() {
+    local level="$1"
+    shift
+
+    local message="$*"
+    local line="$(timestamp) [$level] $message"
+
+    if (( ! QUIET )) || [[ "$level" == "ERROR" ]]; then
+        if [[ "$level" == "ERROR" ]]; then
+            print -u2 -- "$line"
+        else
+            print -- "$line"
+        fi
+    fi
+
+    if (( ! NO_LOG )); then
+        print -r -- "$line" >> "$LOGFILE"
+    fi
+}
+
+info() {
+    log_message INFO "$@"
+}
+
+warn() {
+    log_message WARN "$@"
+}
+
+error() {
+    log_message ERROR "$@"
+}
+
+debug() {
+    (( VERBOSE )) && log_message DEBUG "$@"
+    return 0
+}
+
+# ------------------------------------------------------------
+# Banner
+# ------------------------------------------------------------
+print_banner() {
+    (( QUIET )) && return 0
+
+    if command -v figlet >/dev/null 2>&1; then
+        figlet -f digital "MacPortsUpDate" 2>/dev/null ||
+            print "MacPortsUpDate"
+    else
+        print "MacPortsUpDate"
+    fi
+
+    cat <<EOF
+  _   _
+ ((___))  The Happy Cowboy
+ [ x x ]  Version ${VERSION}
+  \\   /
+  (' ')
+   (U)
+
+EOF
+
+    (( DRY_RUN )) && print "DRY-RUN MODE"
+    (( CHECK_ONLY )) && print "CHECK-ONLY MODE"
+
+    print
+}
+
+# ------------------------------------------------------------
+# MacPorts Detection
+# ------------------------------------------------------------
+detect_macports() {
+    local candidate=""
+
+    if [[ -n "$MP_PREFIX" ]]; then
+        candidate="${MP_PREFIX}/bin/port"
+
+        if [[ ! -x "$candidate" ]]; then
+            error "MacPorts executable not found: $candidate"
+            return 1
+        fi
+    else
+        candidate=$(command -v port 2>/dev/null || true)
+
+        if [[ -z "$candidate" ]]; then
+            candidate="/opt/local/bin/port"
+        fi
+
+        if [[ ! -x "$candidate" ]]; then
+            error "MacPorts executable not found"
+            return 1
+        fi
+
+        candidate="${candidate:A}"
+        MP_PREFIX="${candidate:h:h}"
+    fi
+
+    PORT_BIN="${candidate:A}"
+
+    info "MacPorts executable: $PORT_BIN"
+    info "MacPorts prefix: $MP_PREFIX"
+}
+
+prepare_privileges() {
+    local needs_privilege=0
+
+    if (( EUID != 0 && ! CHECK_ONLY && ! DRY_RUN )); then
+        if (( DO_SELFUPDATE || DO_UPGRADE || CLEANUP_INACTIVE || CLEANUP_SAVED || DO_RECLAIM )); then
+            needs_privilege=1
+        fi
+    fi
+
+    (( needs_privilege == 0 )) && return 0
+
+    SUDO_BIN=$(command -v sudo 2>/dev/null || true)
+    if [[ -z "$SUDO_BIN" ]]; then
+        error "This operation requires superuser privileges, but sudo was not found"
+        return 1
+    fi
+
+    info "Requesting superuser authorization for mutating operations"
+    if ! "$SUDO_BIN" -v; then
+        error "Unable to obtain superuser authorization"
+        return 1
+    fi
+}
+
+build_port_command() {
+    local -a command
+
+    command=()
+    if (( EUID != 0 && ! DRY_RUN )); then
+        command+=("$SUDO_BIN")
+    fi
+    command+=("$PORT_BIN" "$@")
+
+    PORT_COMMAND=("${command[@]}")
+}
+
+validate_macports() {
+    [[ -x "$PORT_BIN" ]] || {
+        error "Invalid MacPorts executable"
+        return 1
+    }
+
+    if ! "$PORT_BIN" version >/dev/null 2>&1; then
+        error "MacPorts installation failed validation"
+        return 1
+    fi
+
+    local version
+    version=$("$PORT_BIN" version)
+
+    info "$version"
+}
+
+# ------------------------------------------------------------
+# Concurrency Lock
+# ------------------------------------------------------------
+acquire_lock() {
+    local lockbase="${TMPDIR:-/tmp}"
+    local prefix_id="${MP_PREFIX//\//_}"
+
+    LOCKDIR="${lockbase%/}/macportsupdate-${prefix_id}.lock"
+
+    if mkdir -- "$LOCKDIR" 2>/dev/null; then
+        LOCK_ACQUIRED=1
+        print "$$" > "${LOCKDIR}/pid"
+
+        debug "Lock acquired: $LOCKDIR"
+        return 0
+    fi
+
+    if [[ ! -d "$LOCKDIR" ]]; then
+        error "Unable to create lock directory: $LOCKDIR"
+        return 1
+    fi
+
+    local pidfile="${LOCKDIR}/pid"
+    local existing_pid=""
+
+    if [[ -f "$pidfile" ]]; then
+        existing_pid=$(<"$pidfile")
+    fi
+
+    if [[ "$existing_pid" == <-> ]]; then
+        if kill -0 "$existing_pid" 2>/dev/null; then
+            error "Another MacPorts update is running (PID $existing_pid)"
+            return 1
+        fi
+    fi
+
+    warn "Stale lock detected: $LOCKDIR"
+
+    if ! rm -f -- "$pidfile" 2>/dev/null; then
+        error "Unable to remove stale PID file"
+        return 1
+    fi
+
+    if ! rmdir -- "$LOCKDIR" 2>/dev/null; then
+        error "Unable to remove stale lock directory"
+        return 1
+    fi
+
+    if ! mkdir -- "$LOCKDIR" 2>/dev/null; then
+        error "Unable to acquire lock after stale-lock cleanup"
+        return 1
+    fi
+
+    LOCK_ACQUIRED=1
+    print "$$" > "${LOCKDIR}/pid"
+
+    info "Recovered stale lock"
+    return 0
+}
+
+release_lock() {
+    if (( LOCK_ACQUIRED )); then
+        rm -f -- "${LOCKDIR}/pid" 2>/dev/null || true
+        rmdir -- "$LOCKDIR" 2>/dev/null || true
+        LOCK_ACQUIRED=0
+    fi
+}
+
+# ------------------------------------------------------------
+# Error and Exit Handling
+# ------------------------------------------------------------
+cleanup() {
+    local exit_code=$?
+
+    if (( LOCK_ACQUIRED )); then
+        if [[ -n "$LOCKDIR" && -d "$LOCKDIR" ]]; then
+            rm -f -- "${LOCKDIR}/pid" 2>/dev/null || true
+            rmdir -- "$LOCKDIR" 2>/dev/null || true
+        fi
+
+        LOCK_ACQUIRED=0
+    fi
+
+    return 0
+}
+trap 'cleanup' EXIT
+
+handle_interrupt() {
+    error "Operation interrupted"
+    exit 130
+}
+trap 'handle_interrupt' INT
+trap 'handle_interrupt' TERM
+
+# ------------------------------------------------------------
+# Command Execution
+# ------------------------------------------------------------
+format_command() {
+    local arg
+    local output=""
+
+    for arg in "$@"; do
+        output+="${(q)arg} "
+    done
+
+    print -r -- "${output% }"
+}
+
+run_readonly() {
+    local command_text
+    command_text=$(format_command "$@")
+
+    debug "Executing: $command_text"
+
+    "$@"
+}
+
+run_mutating() {
+    local command_text
+    command_text=$(format_command "$@")
+
+    if (( DRY_RUN )); then
+        info "DRY-RUN: $command_text"
+        return 0
+    fi
+
+    info "Executing: $command_text"
+
+    local start_time=$EPOCHSECONDS
+    local exit_code=0
+    local duration=0
+
+    "$@" || exit_code=$?
+
+    duration=$(( EPOCHSECONDS - start_time ))
+
+    if (( exit_code == 0 )); then
+        info "Completed successfully in ${duration}s"
+    else
+        error "Command failed with exit code $exit_code"
+        error "Command: $command_text"
+    fi
+
+    return "$exit_code"
+}
+
+run_port_mutating() {
+    local -a command
+
+    build_port_command "$@"
+    command=("${PORT_COMMAND[@]}")
+    run_mutating "${command[@]}"
+}
+
+# ------------------------------------------------------------
+# MacPorts Operations
+# ------------------------------------------------------------
+check_health() {
+    info "Checking MacPorts installation"
+
+    run_readonly "$PORT_BIN" version
+
+    if (( CHECK_ONLY )); then
+        info "Running MacPorts diagnostics"
+        run_readonly "$PORT_BIN" diagnose
+    fi
+}
+
+list_outdated() {
+    info "Checking outdated ports"
+
+    local output
+    local exit_code=0
+    local count=0
+    local line
+
+    output=$("$PORT_BIN" outdated 2>&1) || exit_code=$?
+
+    if (( exit_code != 0 )); then
+        error "Failed to query outdated ports (exit $exit_code)"
+        print -r -- "$output"
+        return "$exit_code"
+    fi
+
+    print -r -- "$output"
+
+    for line in ${(f)output}; do
+        if [[ "$line" == *" < "* ]]; then
+            (( ++count ))
+        fi
+    done
+
+    REPLY="$count"
+    OUTDATED_COUNT=$count
+
+    debug "Found $count outdated ports"
+
+    return 0
+}
+
+selfupdate() {
+    info "Updating MacPorts and ports tree"
+
+    if run_port_mutating selfupdate; then
+        if (( DRY_RUN )); then
+            SELFUPDATE_STATUS="DRY-RUN"
+        else
+            SELFUPDATE_STATUS="SUCCESS"
+        fi
+    else
+        SELFUPDATE_STATUS="FAILED"
+        return 1
+    fi
+}
+
+upgrade_outdated() {
+    info "Upgrading outdated ports"
+
+    local -a cmd
+    (( ASSUME_YES )) && cmd+=(-N)
+
+    cmd+=(upgrade outdated)
+
+    if run_port_mutating "${cmd[@]}"; then
+        if (( DRY_RUN )); then
+            UPGRADE_STATUS="DRY-RUN"
+        else
+            UPGRADE_STATUS="SUCCESS"
+        fi
+    else
+        UPGRADE_STATUS="FAILED"
+        return 1
+    fi
+}
+
+cleanup_inactive() {
+    info "Removing inactive ports"
+
+    if run_port_mutating uninstall inactive; then
+        INACTIVE_STATUS=$(
+            (( DRY_RUN )) && print DRY-RUN || print SUCCESS
+        )
+    else
+        INACTIVE_STATUS="FAILED"
+        return 1
+    fi
+}
+
+cleanup_saved() {
+    info "Searching for saved MacPorts files"
+
+    local -a files
+
+    files=(
+        "${MP_PREFIX}"/etc/**/*.mpsaved(N)
+        "${MP_PREFIX}"/etc/**/*.mp_*(N)
+    )
+
+    if (( ${#files} == 0 )); then
+        info "No saved files found"
+        SAVED_STATUS="NONE"
+        return 0
+    fi
+
+    info "Found ${#files} saved files"
+
+    local file
+    for file in "${files[@]}"; do
+        print -r -- "$file"
+    done
+
+    if (( DRY_RUN )); then
+        SAVED_STATUS="DRY-RUN"
+        return 0
+    fi
+
+    if (( ! ASSUME_YES )); then
+        print -n "Remove these files? [y/N]: "
+
+        local answer
+        read -r answer
+
+        if [[ "$answer" != [yY] && "$answer" != [yY][eE][sS] ]]; then
+            SAVED_STATUS="CANCELLED"
+            return 0
+        fi
+    fi
+
+    local -a command
+    command=(rm -f -- "${files[@]}")
+    if (( EUID != 0 )); then
+        command=("$SUDO_BIN" "${command[@]}")
+    fi
+
+    if ! run_mutating "${command[@]}"; then
+        SAVED_STATUS="FAILED"
+        return 1
+    fi
+
+    SAVED_STATUS="SUCCESS"
+}
+
+reclaim_ports() {
+    info "Running MacPorts reclaim"
+
+    local -a cmd
+    (( ASSUME_YES )) && cmd+=(-N)
+
+    cmd+=(reclaim)
+
+    if run_port_mutating "${cmd[@]}"; then
+        RECLAIM_STATUS=$(
+            (( DRY_RUN )) && print DRY-RUN || print SUCCESS
+        )
+    else
+        RECLAIM_STATUS="FAILED"
+        return 1
+    fi
+}
+
+# ------------------------------------------------------------
+# Summary
+# ------------------------------------------------------------
+print_summary() {
+    local duration=$((EPOCHSECONDS - START_TIME))
+
+    print
+    print "MacPorts Update Summary"
+    print "=============================================================================="
+    printf "%-23s %s\n" "Version" "$VERSION"
+    printf "%-23s %s\n" "Prefix" "$MP_PREFIX"
+    printf "%-23s %s\n" "Selfupdate" "$SELFUPDATE_STATUS"
+    printf "%-23s %s\n" "Upgrade" "$UPGRADE_STATUS"
+    printf "%-23s %s\n" "Outdated Before" "$OUTDATED_BEFORE"
+    printf "%-23s %s\n" "Outdated After" "$OUTDATED_AFTER"
+    printf "%-23s %s\n" "Inactive Cleanup" "$INACTIVE_STATUS"
+    printf "%-23s %s\n" "Saved Cleanup" "$SAVED_STATUS"
+    printf "%-23s %s\n" "Reclaim" "$RECLAIM_STATUS"
+    printf "%-23s %s\n" "Duration" "${duration}s"
+
+    if (( NO_LOG )); then
+        printf "%-23s %s\n" "Logging" "DISABLED"
+    else
+        printf "%-23s %s\n" "Log File" "$LOGFILE"
+    fi
+
+    print "=============================================================================="
+
+    if (( FINAL_STATUS == 0 )); then
+        print "Status: SUCCESS"
+    else
+        print "Status: FAILED ($FINAL_STATUS)"
+    fi
+    print
+}
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+main() {
+    parse_arguments "$@"
+
+    initialize_logging
+    print_banner
+
+    info "Starting MacPortsUpDate ${VERSION}"
+
+    if ! detect_macports; then
+        FINAL_STATUS=1
+        print_summary
+        return 1
+    fi
+
+    if ! validate_macports; then
+        FINAL_STATUS=1
+        print_summary
+        return 1
+    fi
+
+    if ! prepare_privileges; then
+        FINAL_STATUS=1
+        print_summary
+        return 1
+    fi
+
+    if ! acquire_lock; then
+        FINAL_STATUS=1
+        print_summary
+        return 1
+    fi
+
+    if ! check_health; then
+        FINAL_STATUS=1
+        print_summary
+        return 1
+    fi
+
+    if (( CHECK_ONLY )); then
+        if ! list_outdated; then
+            FINAL_STATUS=1
+            print_summary
+            return 1
+        fi
+        OUTDATED_BEFORE="$OUTDATED_COUNT"
+        OUTDATED_AFTER="$OUTDATED_COUNT"
+
+        print_summary
+        return 0
+    fi
+
+    if (( DO_SELFUPDATE )); then
+        if ! selfupdate; then
+            FINAL_STATUS=1
+            print_summary
+            return 1
+        fi
+    else
+        info "Skipping selfupdate"
+    fi
+
+    if ! list_outdated; then
+        FINAL_STATUS=1
+        print_summary
+        return 1
+    fi
+    OUTDATED_BEFORE="$OUTDATED_COUNT"
+
+    if (( DO_UPGRADE )); then
+        if ! upgrade_outdated; then
+            FINAL_STATUS=1
+            print_summary
+            return 1
+        fi
+    else
+        info "Skipping upgrade"
+    fi
+
+    if (( CLEANUP_INACTIVE )); then
+        if ! cleanup_inactive; then
+            FINAL_STATUS=1
+            print_summary
+            return 1
+        fi
+    fi
+
+    if (( CLEANUP_SAVED )); then
+        if ! cleanup_saved; then
+            FINAL_STATUS=1
+            print_summary
+            return 1
+        fi
+    fi
+
+    if (( DO_RECLAIM )); then
+        if ! reclaim_ports; then
+            FINAL_STATUS=1
+            print_summary
+            return 1
+        fi
+    fi
+
+    if ! list_outdated; then
+        FINAL_STATUS=1
+        print_summary
+        return 1
+    fi
+    OUTDATED_AFTER="$OUTDATED_COUNT"
+
+    print_summary
+
+    info "MacPorts maintenance completed"
+}
+
+main "$@"

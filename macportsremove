@@ -1,0 +1,534 @@
+#!/usr/bin/env zsh
+#
+# MacPortsRemove 3.0.0
+# Safely remove MacPorts and its system integration files.
+#
+
+emulate -R zsh
+setopt ERR_EXIT NO_UNSET PIPE_FAIL
+
+zmodload zsh/datetime || {
+    print -u2 "ERROR: Unable to load zsh/datetime module"
+    exit 1
+}
+
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
+readonly VERSION="3.0.0"
+readonly PROGNAME="${0:t}"
+
+typeset -g MP_PREFIX=""
+typeset -g PORT_BIN=""
+typeset -g SUDO_BIN=""
+typeset -g LOGFILE=""
+typeset -g LOCKDIR=""
+typeset -ga REMOVE_PATHS=()
+
+typeset -gi DRY_RUN=0
+typeset -gi ASSUME_YES=0
+typeset -gi VERBOSE=0
+typeset -gi QUIET=0
+typeset -gi NO_LOG=0
+typeset -gi LOCK_ACQUIRED=0
+typeset -gi FINAL_STATUS=0
+typeset -gi START_TIME=$EPOCHSECONDS
+
+typeset -g PORT_STATUS="SKIPPED"
+typeset -g ACCOUNT_STATUS="SKIPPED"
+typeset -g FILE_STATUS="SKIPPED"
+
+# ------------------------------------------------------------
+# Usage
+# ------------------------------------------------------------
+usage() {
+    cat <<EOF
+MacPortsRemove ${VERSION}
+
+Usage:
+  ${PROGNAME} [OPTIONS]
+
+Options:
+  --prefix PATH         MacPorts installation prefix
+  --dry-run             Preview all removal commands
+  --yes                 Skip the confirmation prompt
+  --verbose             Enable detailed output
+  --quiet               Suppress informational console output
+  --log-file PATH       Specify log file
+  --no-log              Disable file logging
+  --version             Display version
+  -h, --help            Display this help
+
+The removal operation requests sudo when run by a regular user. It removes:
+  1. Installed MacPorts ports
+  2. The macports user and group, when present
+  3. Known MacPorts application, launch, receipt, and Tcl directories
+
+This operation is destructive. Use --dry-run to inspect it first.
+EOF
+}
+
+# ------------------------------------------------------------
+# Argument Parsing
+# ------------------------------------------------------------
+parse_arguments() {
+    while (( $# )); do
+        case "$1" in
+            --prefix|--log-file)
+                if (( $# < 2 )) || [[ -z "$2" || "$2" == --* ]]; then
+                    print -u2 "ERROR: $1 requires a value"
+                    return 2
+                fi
+                if [[ "$1" == "--prefix" ]]; then
+                    MP_PREFIX="$2"
+                else
+                    LOGFILE="$2"
+                fi
+                shift 2
+                ;;
+            --prefix=*)
+                MP_PREFIX="${1#*=}"
+                shift
+                ;;
+            --log-file=*)
+                LOGFILE="${1#*=}"
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=1
+                shift
+                ;;
+            --yes)
+                ASSUME_YES=1
+                shift
+                ;;
+            --verbose)
+                VERBOSE=1
+                shift
+                ;;
+            --quiet)
+                QUIET=1
+                shift
+                ;;
+            --no-log)
+                NO_LOG=1
+                shift
+                ;;
+            --version)
+                print "MacPortsRemove ${VERSION}"
+                exit 0
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                print -u2 "ERROR: Unknown argument: $1"
+                return 2
+                ;;
+        esac
+    done
+
+    if [[ -n "$MP_PREFIX" && "$MP_PREFIX" != /* ]]; then
+        print -u2 "ERROR: --prefix must be an absolute path"
+        return 2
+    fi
+
+    if [[ -z "$LOGFILE" && $NO_LOG -eq 0 ]]; then
+        LOGFILE="${HOME}/.local/state/macportsremove/remove.log"
+    fi
+
+    if [[ -n "$LOGFILE" && "$LOGFILE" != /* ]]; then
+        print -u2 "ERROR: --log-file must be an absolute path"
+        return 2
+    fi
+}
+
+# ------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------
+timestamp() {
+    strftime "%Y-%m-%dT%H:%M:%SZ" "$EPOCHSECONDS"
+}
+
+log_message() {
+    local level="$1"
+    shift
+    local line="$(timestamp) [$level] $*"
+
+    if (( ! QUIET )) || [[ "$level" == "ERROR" ]]; then
+        if [[ "$level" == "ERROR" ]]; then
+            print -u2 -- "$line"
+        else
+            print -- "$line"
+        fi
+    fi
+
+    if (( ! NO_LOG )); then
+        print -r -- "$line" >> "$LOGFILE"
+    fi
+}
+
+info() {
+    log_message INFO "$@"
+}
+
+warn() {
+    log_message WARN "$@"
+}
+
+error() {
+    log_message ERROR "$@"
+}
+
+debug() {
+    (( VERBOSE )) && log_message DEBUG "$@"
+    return 0
+}
+
+initialize_logging() {
+    (( NO_LOG )) && return 0
+
+    if ! mkdir -p -- "${LOGFILE:h}" 2>/dev/null; then
+        print -u2 "WARNING: Cannot create log directory: ${LOGFILE:h}"
+        NO_LOG=1
+        return 0
+    fi
+
+    if ! touch -- "$LOGFILE" 2>/dev/null; then
+        print -u2 "WARNING: Cannot write log file: $LOGFILE"
+        NO_LOG=1
+    fi
+}
+
+# ------------------------------------------------------------
+# Banner
+# ------------------------------------------------------------
+print_banner() {
+    (( QUIET )) && return 0
+
+    if command -v figlet >/dev/null 2>&1; then
+        figlet -f digital "MacPortsRemove" 2>/dev/null ||
+            print "MacPortsRemove"
+    else
+        print "MacPortsRemove"
+    fi
+
+    cat <<EOF
+  _   _
+ ((___))  The Happy Cowboy
+ [ x x ]  Version ${VERSION}
+  \\   /
+  (' ')
+   (U)
+
+EOF
+
+    (( DRY_RUN )) && print "DRY-RUN MODE"
+
+    print
+}
+
+# ------------------------------------------------------------
+# MacPorts Detection
+# ------------------------------------------------------------
+detect_macports() {
+    local candidate=""
+
+    if [[ -n "$MP_PREFIX" ]]; then
+        candidate="${MP_PREFIX}/bin/port"
+    else
+        candidate=$(command -v port 2>/dev/null || true)
+        [[ -n "$candidate" ]] || candidate="/opt/local/bin/port"
+    fi
+
+    if [[ ! -x "$candidate" ]]; then
+        error "MacPorts executable not found: $candidate"
+        return 1
+    fi
+
+    PORT_BIN="${candidate:A}"
+    MP_PREFIX="${PORT_BIN:h:h}"
+    info "MacPorts executable: $PORT_BIN"
+    info "MacPorts prefix: $MP_PREFIX"
+}
+
+validate_macports() {
+    local version
+
+    if ! "$PORT_BIN" version >/dev/null 2>&1; then
+        error "MacPorts installation failed validation"
+        return 1
+    fi
+
+    version=$("$PORT_BIN" version)
+    info "$version"
+}
+
+prepare_privileges() {
+    if (( EUID == 0 || DRY_RUN )); then
+        return 0
+    fi
+
+    SUDO_BIN=$(command -v sudo 2>/dev/null || true)
+    if [[ -z "$SUDO_BIN" ]]; then
+        error "Removal requires superuser privileges, but sudo was not found"
+        return 1
+    fi
+
+    info "Requesting superuser authorization"
+    if ! "$SUDO_BIN" -v; then
+        error "Unable to obtain superuser authorization"
+        return 1
+    fi
+}
+
+# ------------------------------------------------------------
+# Concurrency Lock
+# ------------------------------------------------------------
+acquire_lock() {
+    local lockbase="${TMPDIR:-/tmp}"
+    local prefix_id="${MP_PREFIX//\//_}"
+
+    LOCKDIR="${lockbase%/}/macportsremove-${prefix_id}.lock"
+
+    if mkdir -- "$LOCKDIR" 2>/dev/null; then
+        LOCK_ACQUIRED=1
+        print "$$" > "${LOCKDIR}/pid"
+        return 0
+    fi
+
+    local existing_pid=""
+    [[ -f "${LOCKDIR}/pid" ]] && existing_pid=$(<"${LOCKDIR}/pid")
+    if [[ "$existing_pid" == <-> ]] &&
+        kill -0 "$existing_pid" 2>/dev/null; then
+        error "Another MacPorts removal is running (PID $existing_pid)"
+        return 1
+    fi
+
+    warn "Removing stale lock: $LOCKDIR"
+    if ! rm -rf -- "$LOCKDIR"; then
+        error "Unable to remove stale lock"
+        return 1
+    fi
+    if ! mkdir -- "$LOCKDIR" 2>/dev/null; then
+        error "Unable to acquire removal lock"
+        return 1
+    fi
+
+    LOCK_ACQUIRED=1
+    print "$$" > "${LOCKDIR}/pid"
+}
+
+# ------------------------------------------------------------
+# Error and Exit Handling
+# ------------------------------------------------------------
+cleanup() {
+    if (( LOCK_ACQUIRED )); then
+        rm -f -- "${LOCKDIR}/pid" 2>/dev/null || true
+        rmdir -- "$LOCKDIR" 2>/dev/null || true
+        LOCK_ACQUIRED=0
+    fi
+}
+trap cleanup EXIT
+
+handle_interrupt() {
+    error "Operation interrupted"
+    exit 130
+}
+trap handle_interrupt INT
+trap handle_interrupt TERM
+
+format_command() {
+    local arg
+    local output=""
+
+    for arg in "$@"; do
+        output+="${(q)arg} "
+    done
+    print -r -- "${output% }"
+}
+
+run_command() {
+    local command_text
+    local exit_code=0
+
+    command_text=$(format_command "$@")
+    if (( DRY_RUN )); then
+        info "DRY-RUN: $command_text"
+        return 0
+    fi
+
+    info "Executing: $command_text"
+    "$@" || exit_code=$?
+    if (( exit_code != 0 )); then
+        error "Command failed with exit code $exit_code"
+        error "Command: $command_text"
+    fi
+    return "$exit_code"
+}
+
+run_privileged() {
+    local -a command
+
+    command=()
+    if (( EUID != 0 && ! DRY_RUN )); then
+        command+=("$SUDO_BIN")
+    fi
+    command+=("$@")
+    run_command "${command[@]}"
+}
+
+confirm_removal() {
+    (( ASSUME_YES || DRY_RUN )) && return 0
+
+    print -u2 "This will uninstall MacPorts and remove its system files."
+    print -n -u2 "Continue? [y/N]: "
+
+    local answer=""
+    if ! read -r answer; then
+        error "Unable to read confirmation"
+        return 1
+    fi
+
+    if [[ "$answer" != [yY] && "$answer" != [yY][eE][sS] ]]; then
+        info "Removal cancelled"
+        return 1
+    fi
+}
+
+remove_ports() {
+    info "Uninstalling installed MacPorts ports"
+
+    if run_privileged "$PORT_BIN" -fp uninstall installed; then
+        PORT_STATUS="SUCCESS"
+    else
+        PORT_STATUS="FAILED"
+        return 1
+    fi
+}
+
+remove_account() {
+    local account_type="$1"
+    local account_path="$2"
+
+    if ! dscl . -read "$account_path" >/dev/null 2>&1; then
+        info "Account not present: $account_path"
+        return 0
+    fi
+
+    if run_privileged dscl . -delete "$account_path"; then
+        return 0
+    fi
+
+    error "Failed to remove ${account_type}: $account_path"
+    return 1
+}
+
+remove_accounts() {
+    info "Removing MacPorts user and group when present"
+
+    if ! remove_account user /Users/macports ||
+        ! remove_account group /Groups/macports; then
+        ACCOUNT_STATUS="FAILED"
+        return 1
+    fi
+
+    ACCOUNT_STATUS="SUCCESS"
+}
+
+collect_paths() {
+    REMOVE_PATHS=(
+        /Applications/DarwinPorts
+        /Applications/MacPorts
+        /Library/LaunchDaemons/org.macports.*(N)
+        /Library/Receipts/DarwinPorts*.pkg(N)
+        /Library/Receipts/MacPorts*.pkg(N)
+        /Library/StartupItems/DarwinPortsStartup
+        /Library/Tcl/darwinports1.0
+        /Library/Tcl/macports1.0
+    )
+}
+
+remove_files() {
+    collect_paths
+
+    if (( ${#REMOVE_PATHS} == 0 )); then
+        info "No MacPorts system files found"
+        FILE_STATUS="NONE"
+        return 0
+    fi
+
+    info "MacPorts paths selected for removal:"
+    local path
+    for path in "${REMOVE_PATHS[@]}"; do
+        info "  $path"
+    done
+
+    if run_privileged rm -rf -- "${REMOVE_PATHS[@]}"; then
+        FILE_STATUS="SUCCESS"
+    else
+        FILE_STATUS="FAILED"
+        return 1
+    fi
+}
+
+# ------------------------------------------------------------
+# Summary
+# ------------------------------------------------------------
+print_summary() {
+    local duration=$((EPOCHSECONDS - START_TIME))
+
+    print
+    print "MacPorts Removal Summary"
+    print "=============================================================================="
+    printf "%-23s %s\n" "Version" "$VERSION"
+    printf "%-23s %s\n" "Prefix" "$MP_PREFIX"
+    printf "%-23s %s\n" "Port Uninstall" "$PORT_STATUS"
+    printf "%-23s %s\n" "Account Removal" "$ACCOUNT_STATUS"
+    printf "%-23s %s\n" "File Removal" "$FILE_STATUS"
+    printf "%-23s %s\n" "Duration" "${duration}s"
+    if (( NO_LOG )); then
+        printf "%-23s %s\n" "Logging" "DISABLED"
+    else
+        printf "%-23s %s\n" "Log File" "$LOGFILE"
+    fi
+    print "=============================================================================="
+    if (( FINAL_STATUS == 0 )); then
+        print "Status: SUCCESS"
+    else
+        print "Status: FAILED ($FINAL_STATUS)"
+    fi
+}
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+main() {
+    parse_arguments "$@"
+    initialize_logging
+    print_banner
+
+    if (( DRY_RUN )); then
+        info "Starting MacPortsRemove ${VERSION} in dry-run mode"
+    else
+        info "Starting MacPortsRemove ${VERSION}"
+    fi
+
+    if ! detect_macports ||
+        ! validate_macports ||
+        ! prepare_privileges ||
+        ! acquire_lock ||
+        ! confirm_removal ||
+        ! remove_ports ||
+        ! remove_accounts ||
+        ! remove_files; then
+        FINAL_STATUS=1
+        print_summary
+        return 1
+    fi
+
+    print_summary
+}
+
+main "$@"
